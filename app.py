@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, colorchooser
 import json as _json
+import sqlite3
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from datetime import datetime
@@ -14,7 +15,8 @@ if getattr(sys, "frozen", False):
     BASE_DIR = os.path.join(os.path.expanduser("~"), "Documents", "업무노트")
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-EXCEL_PATH = os.path.join(BASE_DIR, "업무교육.xlsx")
+DB_PATH    = os.path.join(BASE_DIR, "업무교육.db")
+EXCEL_PATH = os.path.join(BASE_DIR, "업무교육.xlsx")  # 마이그레이션/가져오기/내보내기용
 IMG_DIR    = os.path.join(BASE_DIR, "images")
 COLUMNS    = ["ID", "날짜", "카테고리", "태그", "제목", "내용", "이미지"]
 THUMB_SIZE = (120, 90)
@@ -455,7 +457,7 @@ class WorkNotesApp:
         self._thumb_refs = []  # GC 방지
 
         self._build_ui()
-        self._load_excel()
+        self._load_db()
         self._refresh_categories()
         self._apply_filter()
 
@@ -660,18 +662,56 @@ class WorkNotesApp:
                 "태그": tag, "제목": title, "내용": content, "이미지": "",
             })
         self.next_id = len(samples) + 1
-        self._save_excel(silent=True)
+        self._save_db(silent=True)
         self._set_status(f"샘플 데이터 {len(samples)}개 추가됨")
 
-    def _load_excel(self):
-        if not os.path.exists(EXCEL_PATH):
+    def _init_db(self, conn):
+        conn.execute("""CREATE TABLE IF NOT EXISTS records (
+            id      INTEGER PRIMARY KEY,
+            날짜    TEXT DEFAULT '',
+            카테고리 TEXT DEFAULT '',
+            태그    TEXT DEFAULT '',
+            제목    TEXT DEFAULT '',
+            내용    TEXT DEFAULT '',
+            이미지  TEXT DEFAULT ''
+        )""")
+        conn.commit()
+
+    def _load_db(self):
+        # 기존 Excel이 있고 DB가 없으면 자동 마이그레이션
+        if not os.path.exists(DB_PATH) and os.path.exists(EXCEL_PATH):
+            self._migrate_from_excel()
+            return
+        if not os.path.exists(DB_PATH):
             self._seed_sample_data()
             return
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            self._init_db(conn)
+            rows = conn.execute(
+                "SELECT id, 날짜, 카테고리, 태그, 제목, 내용, 이미지 FROM records ORDER BY id"
+            ).fetchall()
+            conn.close()
+            max_id = 0
+            for row in rows:
+                self.records.append({
+                    "ID": str(row[0]), "날짜": row[1] or "", "카테고리": row[2] or "",
+                    "태그": row[3] or "", "제목": row[4] or "",
+                    "내용": row[5] or "", "이미지": row[6] or "",
+                })
+                max_id = max(max_id, row[0])
+            self.next_id = max_id + 1
+            self._set_status(f"DB 로드 완료 — {len(self.records)}개 항목")
+        except Exception as e:
+            messagebox.showerror("오류", f"DB를 불러오지 못했습니다:\n{e}")
+
+    def _migrate_from_excel(self):
         try:
             wb = openpyxl.load_workbook(EXCEL_PATH)
             ws = wb.active
             rows = list(ws.iter_rows(values_only=True))
             if not rows:
+                self._seed_sample_data()
                 return
             header = [str(c) for c in rows[0]]
             max_id = 0
@@ -685,30 +725,26 @@ class WorkNotesApp:
                     pass
                 self.records.append(d)
             self.next_id = max_id + 1
-            self._set_status(f"파일 로드 완료 — {len(self.records)}개 항목")
+            self._save_db(silent=True)
+            self._set_status(f"Excel → DB 마이그레이션 완료 — {len(self.records)}개 항목")
         except Exception as e:
-            messagebox.showerror("오류", f"파일을 불러오지 못했습니다:\n{e}")
+            messagebox.showerror("마이그레이션 오류", str(e))
 
-    def _save_excel(self, silent=False):
+    def _save_db(self, silent=False):
         try:
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "업무교육"
-            header_fill = PatternFill("solid", fgColor="4A90D9")
-            header_font = Font(bold=True, color="FFFFFF")
-            col_w = [8, 14, 16, 20, 36, 60, 30]
-            for ci, (col, w) in enumerate(zip(COLUMNS, col_w), 1):
-                cell = ws.cell(row=1, column=ci, value=col)
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = Alignment(horizontal="center")
-                ws.column_dimensions[cell.column_letter].width = w
-            for ri, rec in enumerate(self.records, 2):
-                for ci, col in enumerate(COLUMNS, 1):
-                    ws.cell(row=ri, column=ci, value=rec.get(col, ""))
-            wb.save(EXCEL_PATH)
+            conn = sqlite3.connect(DB_PATH)
+            self._init_db(conn)
+            conn.execute("DELETE FROM records")
+            conn.executemany(
+                "INSERT INTO records (id, 날짜, 카테고리, 태그, 제목, 내용, 이미지) VALUES (?,?,?,?,?,?,?)",
+                [(int(r["ID"]), r.get("날짜",""), r.get("카테고리",""), r.get("태그",""),
+                  r.get("제목",""), r.get("내용",""), r.get("이미지",""))
+                 for r in self.records]
+            )
+            conn.commit()
+            conn.close()
             if not silent:
-                self._set_status(f"저장 완료 ({EXCEL_PATH})")
+                self._set_status(f"저장 완료")
         except Exception as e:
             messagebox.showerror("저장 오류", str(e))
 
@@ -774,7 +810,7 @@ class WorkNotesApp:
                 imported += 1
             self._refresh_categories()
             self._apply_filter()
-            self._save_excel(silent=True)
+            self._save_db(silent=True)
             self._set_status(f"{imported}개 항목 가져오기 완료")
         except Exception as e:
             messagebox.showerror("오류", str(e))
@@ -819,7 +855,7 @@ class WorkNotesApp:
         self._commit_images(rec, dlg.result)
         self._refresh_categories()
         self._apply_filter()
-        self._save_excel(silent=True)
+        self._save_db(silent=True)
         self._select_by_id(rec["ID"])
         self._set_status("항목 추가됨")
 
@@ -842,7 +878,7 @@ class WorkNotesApp:
         self._commit_images(rec, dlg.result)
         self._refresh_categories()
         self._apply_filter()
-        self._save_excel(silent=True)
+        self._save_db(silent=True)
         self._select_by_id(rec["ID"])
         self._set_status("항목 수정됨")
 
@@ -860,7 +896,7 @@ class WorkNotesApp:
         self.records.remove(rec)
         self._refresh_categories()
         self._apply_filter()
-        self._save_excel(silent=True)
+        self._save_db(silent=True)
         self._show_detail(None)
         self._set_status("항목 삭제됨")
 
