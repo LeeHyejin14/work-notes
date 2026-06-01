@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller 빌드 결과물
+build/
+dist/
+*.spec
+
+# 개인 데이터 (로컬에만 보관)
+업무교육.xlsx
+업무교육1.xlsx
+images/
